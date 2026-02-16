@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import ipaddress
 import struct
 import tarfile
 from pathlib import Path
@@ -15,6 +16,15 @@ PCAP_MAGICS = {
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 PCAPNG_SECTION_BOM_LE = b"\x4d\x3c\x2b\x1a"
 PCAPNG_SECTION_BOM_BE = b"\x1a\x2b\x3c\x4d"
+ETH_P_IP = 0x0800
+ETH_P_IPV6 = 0x86DD
+ETH_P_8021Q = 0x8100
+ETH_P_8021AD = 0x88A8
+ETH_P_QINQ = 0x9100
+DLT_EN10MB = 1
+DLT_RAW = 101
+DLT_LINUX_SLL = 113
+DLT_LINUX_SLL2 = 276
 
 
 def parse_datetime(value):
@@ -40,6 +50,16 @@ def parse_datetime(value):
         ) from exc
 
 
+def parse_ip_address(value):
+    """Parse and validate IPv4/IPv6 address input."""
+    try:
+        return ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "invalid IP address. Use a valid IPv4 or IPv6 address"
+        ) from exc
+
+
 def _packet_datetime(seconds_float):
     try:
         return datetime.fromtimestamp(seconds_float)
@@ -47,8 +67,89 @@ def _packet_datetime(seconds_float):
         return None
 
 
-def pcap_time_range(file_path):
-    """Return (first_packet_time, last_packet_time) for classic PCAP files."""
+def _ip_match_ipv4(payload, target_ip):
+    if len(payload) < 20:
+        return False
+    try:
+        src_ip = ipaddress.ip_address(payload[12:16])
+        dst_ip = ipaddress.ip_address(payload[16:20])
+    except ValueError:
+        return False
+    return src_ip == target_ip or dst_ip == target_ip
+
+
+def _ip_match_ipv6(payload, target_ip):
+    if len(payload) < 40:
+        return False
+    try:
+        src_ip = ipaddress.ip_address(payload[8:24])
+        dst_ip = ipaddress.ip_address(payload[24:40])
+    except ValueError:
+        return False
+    return src_ip == target_ip or dst_ip == target_ip
+
+
+def _packet_contains_ip(packet_data, linktype, target_ip):
+    if target_ip is None:
+        return True
+
+    if linktype == DLT_RAW:
+        if len(packet_data) < 1:
+            return False
+        version = packet_data[0] >> 4
+        if version == 4:
+            return _ip_match_ipv4(packet_data, target_ip)
+        if version == 6:
+            return _ip_match_ipv6(packet_data, target_ip)
+        return False
+
+    if linktype == DLT_EN10MB:
+        if len(packet_data) < 14:
+            return False
+        offset = 14
+        ethertype = struct.unpack("!H", packet_data[12:14])[0]
+
+        # Skip VLAN tags if present.
+        while ethertype in (ETH_P_8021Q, ETH_P_8021AD, ETH_P_QINQ):
+            if len(packet_data) < offset + 4:
+                return False
+            ethertype = struct.unpack("!H", packet_data[offset + 2 : offset + 4])[0]
+            offset += 4
+
+        payload = packet_data[offset:]
+        if ethertype == ETH_P_IP:
+            return _ip_match_ipv4(payload, target_ip)
+        if ethertype == ETH_P_IPV6:
+            return _ip_match_ipv6(payload, target_ip)
+        return False
+
+    if linktype == DLT_LINUX_SLL:
+        if len(packet_data) < 16:
+            return False
+        ethertype = struct.unpack("!H", packet_data[14:16])[0]
+        payload = packet_data[16:]
+        if ethertype == ETH_P_IP:
+            return _ip_match_ipv4(payload, target_ip)
+        if ethertype == ETH_P_IPV6:
+            return _ip_match_ipv6(payload, target_ip)
+        return False
+
+    if linktype == DLT_LINUX_SLL2:
+        if len(packet_data) < 20:
+            return False
+        ethertype = struct.unpack("!H", packet_data[0:2])[0]
+        payload = packet_data[20:]
+        if ethertype == ETH_P_IP:
+            return _ip_match_ipv4(payload, target_ip)
+        if ethertype == ETH_P_IPV6:
+            return _ip_match_ipv6(payload, target_ip)
+        return False
+
+    return False
+
+
+def pcap_matches(file_path, begin_time, end_time, target_ip=None):
+    """Return True if a classic PCAP file matches requested filters."""
     with file_path.open("rb") as f:
         magic = f.read(4)
         magic_info = PCAP_MAGICS.get(magic)
@@ -64,6 +165,8 @@ def pcap_time_range(file_path):
 
         first_ts = None
         last_ts = None
+        ip_match_in_window = False
+        linktype = struct.unpack(f"{endian}I", remainder[16:20])[0]
 
         while True:
             packet_header = f.read(16)
@@ -82,12 +185,23 @@ def pcap_time_range(file_path):
                 first_ts = timestamp
             last_ts = timestamp
 
-            # Skip packet bytes.
-            f.seek(incl_len, 1)
+            packet_data = f.read(incl_len)
+            if len(packet_data) < incl_len:
+                return None
+            if (
+                target_ip is not None
+                and begin_time <= timestamp <= end_time
+                and _packet_contains_ip(packet_data, linktype, target_ip)
+            ):
+                ip_match_in_window = True
 
         if first_ts is None:
             return None
-        return (first_ts, last_ts)
+
+        if target_ip is not None:
+            return ip_match_in_window
+
+        return first_ts <= end_time and begin_time <= last_ts
 
 
 def _parse_pcapng_if_tsresol(options_bytes, endian):
@@ -120,8 +234,8 @@ def _parse_pcapng_if_tsresol(options_bytes, endian):
     return seconds_per_unit
 
 
-def pcapng_time_range(file_path):
-    """Return (first_packet_time, last_packet_time) for PCAPNG files."""
+def pcapng_matches(file_path, begin_time, end_time, target_ip=None):
+    """Return True if a PCAPNG file matches requested filters."""
     with file_path.open("rb") as f:
         block_header = f.read(8)
         if len(block_header) < 8 or block_header[0:4] != PCAPNG_MAGIC:
@@ -148,6 +262,8 @@ def pcapng_time_range(file_path):
         first_ts = None
         last_ts = None
         interface_resolutions = []
+        interface_linktypes = []
+        ip_match_in_window = False
 
         while True:
             hdr = f.read(8)
@@ -176,7 +292,9 @@ def pcapng_time_range(file_path):
             if block_type == 0x00000001:
                 if len(body) < 8:
                     return None
+                linktype = struct.unpack(f"{endian}H", body[0:2])[0]
                 options = body[8:]
+                interface_linktypes.append(linktype)
                 interface_resolutions.append(
                     _parse_pcapng_if_tsresol(options, endian)
                 )
@@ -201,6 +319,22 @@ def pcapng_time_range(file_path):
                 if first_ts is None:
                     first_ts = timestamp
                 last_ts = timestamp
+                if target_ip is not None:
+                    cap_len = struct.unpack(f"{endian}I", body[12:16])[0]
+                    if len(body) < 20 + cap_len:
+                        return None
+                    packet_data = body[20 : 20 + cap_len]
+                    linktype = (
+                        interface_linktypes[interface_id]
+                        if interface_id < len(interface_linktypes)
+                        else None
+                    )
+                    if (
+                        linktype is not None
+                        and begin_time <= timestamp <= end_time
+                        and _packet_contains_ip(packet_data, linktype, target_ip)
+                    ):
+                        ip_match_in_window = True
                 continue
 
             # Obsolete Packet Block: if_id+drop_count(4), ts_high, ts_low, ...
@@ -221,37 +355,55 @@ def pcapng_time_range(file_path):
                 if first_ts is None:
                     first_ts = timestamp
                 last_ts = timestamp
+                if target_ip is not None:
+                    cap_len = struct.unpack(f"{endian}I", body[12:16])[0]
+                    if len(body) < 20 + cap_len:
+                        return None
+                    packet_data = body[20 : 20 + cap_len]
+                    linktype = (
+                        interface_linktypes[interface_id]
+                        if interface_id < len(interface_linktypes)
+                        else None
+                    )
+                    if (
+                        linktype is not None
+                        and begin_time <= timestamp <= end_time
+                        and _packet_contains_ip(packet_data, linktype, target_ip)
+                    ):
+                        ip_match_in_window = True
 
         if first_ts is None:
             return None
-        return (first_ts, last_ts)
+
+        if target_ip is not None:
+            return ip_match_in_window
+
+        return first_ts <= end_time and begin_time <= last_ts
 
 
-def capture_time_range(file_path):
+def capture_matches(file_path, begin_time, end_time, target_ip=None):
     with file_path.open("rb") as f:
         signature = f.read(4)
 
     if signature in PCAP_MAGICS:
-        return pcap_time_range(file_path)
+        return pcap_matches(file_path, begin_time, end_time, target_ip)
     if signature == PCAPNG_MAGIC:
-        return pcapng_time_range(file_path)
+        return pcapng_matches(file_path, begin_time, end_time, target_ip)
     return None
 
 
-def find_pcap_files(directory, begin_time, end_time):
+def find_pcap_files(directory, begin_time, end_time, target_ip=None):
     matching_files = []
 
     for entry in sorted(directory.iterdir()):
         if not entry.is_file():
             continue
 
-        time_range = capture_time_range(entry)
-        if time_range is None:
+        is_match = capture_matches(entry, begin_time, end_time, target_ip)
+        if is_match is None:
             continue
 
-        first_ts, last_ts = time_range
-        # Match if file's packet-time window overlaps requested window.
-        if first_ts <= end_time and begin_time <= last_ts:
+        if is_match:
             matching_files.append(entry.name)
 
     return matching_files
@@ -284,6 +436,7 @@ def main():
             "  pcap_file_finder.py -d ./captures -b '2026-02-15 10:00:00' -e '2026-02-15 11:00:00'\n"
             "  pcap_file_finder.py --directory ./captures --begin 1707985200 --end 1707988800\n"
             "  pcap_file_finder.py -d ./captures -b 1707985200 -e 1707988800 --x selected_caps\n"
+            "  pcap_file_finder.py -d ./captures -b '2026-02-15 10:00:00' -e '2026-02-15 11:00:00' --ip 2001:db8::1\n"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -318,6 +471,14 @@ def main():
             "(if .tar.gz is omitted, it is added automatically)"
         ),
     )
+    parser.add_argument(
+        "--ip",
+        type=parse_ip_address,
+        help=(
+            "Only match files containing packets within the time window where "
+            "source or destination IP equals this IPv4/IPv6 address"
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -326,7 +487,7 @@ def main():
     if args.begin > args.end:
         parser.error("--begin must be earlier than or equal to --end")
 
-    matching_files = find_pcap_files(args.directory, args.begin, args.end)
+    matching_files = find_pcap_files(args.directory, args.begin, args.end, args.ip)
 
     if matching_files:
         print("Matching files:")
