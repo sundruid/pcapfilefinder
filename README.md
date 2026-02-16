@@ -8,6 +8,7 @@ This is useful when you have many captures and need to quickly isolate only the 
 
 - Supports **PCAP** and **PCAPNG** file formats by reading file content, not filename patterns.
 - Filters files by **packet timestamp overlap** with a user-provided begin/end time.
+- Optional `--ip` filter for **IPv4/IPv6 source or destination address** matching.
 - Accepts flexible time input:
   - `YYYY-MM-DD`
   - `YYYY-MM-DD HH:MM`
@@ -22,8 +23,8 @@ This is useful when you have many captures and need to quickly isolate only the 
 
 1. Iterates through regular files in the target directory.
 2. Detects each file format using binary signatures (PCAP/PCAPNG).
-3. Parses packet headers to determine each file's first and last packet timestamps.
-4. Compares that range to your requested time window.
+3. Parses packet headers to determine each file's packet timestamp range.
+4. If `--ip` is set, checks packets in the selected time window for a matching source/destination IP.
 5. Prints matching filenames.
 6. If `--x` is provided, packages matched files into a `.tar.gz`.
 
@@ -35,7 +36,7 @@ This is useful when you have many captures and need to quickly isolate only the 
 ## Usage
 
 ```bash
-python3 pcap_file_finder.py -b BEGIN -e END -d DIRECTORY [--x ARCHIVE_NAME]
+python3 pcap_file_finder.py -b BEGIN -e END -d DIRECTORY [--ip IP_ADDRESS] [--x ARCHIVE_NAME]
 ```
 
 ### Arguments
@@ -56,6 +57,10 @@ python3 pcap_file_finder.py -b BEGIN -e END -d DIRECTORY [--x ARCHIVE_NAME]
 - `--x, --extract ARCHIVE_NAME` (optional)  
   Create `ARCHIVE_NAME.tar.gz` in the current local working directory.
   If you omit `.tar.gz`, it is automatically appended.
+
+- `--ip IP_ADDRESS` (optional)  
+  Only match files that contain at least one packet in the requested time window where
+  source or destination IP equals `IP_ADDRESS` (IPv4 or IPv6).
 
 ## Examples
 
@@ -93,6 +98,25 @@ This creates:
 
 You can then move this archive to another system and open the files in tools like Wireshark.
 
+### 4) Filter by IP address (IPv4 or IPv6)
+
+```bash
+python3 pcap_file_finder.py \
+  -d ./captures \
+  -b "2026-02-15 10:00:00" \
+  -e "2026-02-15 11:00:00" \
+  --ip 192.0.2.10
+```
+
+```bash
+python3 pcap_file_finder.py \
+  -d ./captures \
+  -b 1707985200 \
+  -e 1707988800 \
+  --ip 2001:db8::1 \
+  --x ip_filtered_window
+```
+
 ## Output Behavior
 
 - If matches are found:
@@ -106,6 +130,7 @@ You can then move this archive to another system and open the files in tools lik
 
 - The tool reads packet metadata from capture files; it does not inspect protocol payload content.
 - PCAPNG support is based on packet timestamp blocks and interface timestamp resolution handling.
+- IP filtering is packet-level and supports common link types (Ethernet, RAW IP, Linux cooked capture).
 - Files that are truncated or malformed may be skipped.
 - Time interpretation uses the local system timezone behavior of Python `datetime.fromtimestamp()`.
 
@@ -114,6 +139,7 @@ You can then move this archive to another system and open the files in tools lik
 - **No files returned**
   - Confirm your time window is correct (`--begin` <= `--end`).
   - Verify files are valid PCAP/PCAPNG.
+  - If using `--ip`, confirm the address appears as packet source or destination in that window.
   - Try a wider time range.
 
 - **Argument errors**
